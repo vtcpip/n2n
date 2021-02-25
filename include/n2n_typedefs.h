@@ -415,6 +415,7 @@ struct peer_info {
     n2n_ip_subnet_t                  dev_addr;
     n2n_desc_t                       dev_desc;
     n2n_sock_t                       sock;
+    SOCKET                           socket_fd;
     n2n_cookie_t                     last_cookie;
     n2n_auth_t                       auth;
     int                              timeout;
@@ -598,6 +599,7 @@ typedef struct n2n_edge_conf {
     int                register_ttl;           /**< TTL for registration packet when UDP NAT hole punching through supernode. */
     int                local_port;
     int                mgmt_port;
+    uint8_t            connect_tcp;            /** connection to supernode 0 = UDP; 1 = TCP */
     n2n_auth_t         auth;
     filter_rule_t      *network_traffic_filter_rules;
     int                metric;                /**< Network interface metric (Windows only). */
@@ -631,7 +633,7 @@ struct n2n_edge {
 
     /* Sockets */
     /* supernode socket is in        eee->curr_sn->sock (of type n2n_sock_t) */
-    int                              udp_sock;
+    int                              sock;
     int                              udp_mgmt_sock;                      /**< socket for status info. */
 
 #ifndef SKIP_MULTICAST_PEERS_DISCOVERY
@@ -669,18 +671,28 @@ typedef struct sn_stats {
     time_t last_reg_super; /* Time when last REGISTER_SUPER was received. */
 } sn_stats_t;
 
-struct sn_community {
-    char            community[N2N_COMMUNITY_SIZE];
-    uint8_t         is_federation;          /* if not-zero, then the current community is the federation of supernodes */
-    uint8_t         purgeable;              /* indicates purgeable community (fixed-name, predetermined (-c parameter) communties usually are unpurgeable) */
-    uint8_t         header_encryption;      /* Header encryption indicator. */
-    he_context_t    *header_encryption_ctx; /* Header encryption cipher context. */
-    he_context_t    *header_iv_ctx;         /* Header IV ecnryption cipher context, REMOVE as soon as seperate fields for checksum and replay protection available */
-    struct          peer_info *edges;       /* Link list of registered edges. */
-    int64_t         number_enc_packets;     /* Number of encrypted packets handled so far, required for sorting from time to time */
-    n2n_ip_subnet_t auto_ip_net;            /* Address range of auto ip address service. */
+typedef struct node_supernode_association {
+
+    n2n_mac_t                   mac;        /* mac address of an edge                          */
+    const struct sockaddr_in    sock;       /* network order socket of that edge's supernode   */
+    time_t                      last_seen;  /* time mark to keep track of purging requirements */
 
     UT_hash_handle hh;                      /* makes this structure hashable */
+} node_supernode_association_t;
+
+struct sn_community {
+    char                          community[N2N_COMMUNITY_SIZE];
+    uint8_t                       is_federation;          /* if not-zero, then the current community is the federation of supernodes */
+    uint8_t                       purgeable;              /* indicates purgeable community (fixed-name, predetermined (-c parameter) communties usually are unpurgeable) */
+    uint8_t                       header_encryption;      /* Header encryption indicator. */
+    he_context_t                  *header_encryption_ctx; /* Header encryption cipher context. */
+    he_context_t                  *header_iv_ctx;         /* Header IV ecnryption cipher context, REMOVE as soon as seperate fields for checksum and replay protection available */
+    struct                        peer_info *edges;       /* Link list of registered edges. */
+    node_supernode_association_t  *assoc;            /* list of other edges from this community and their supernodes */
+    int64_t                       number_enc_packets;     /* Number of encrypted packets handled so far, required for sorting from time to time */
+    n2n_ip_subnet_t               auto_ip_net;            /* Address range of auto ip address service. */
+
+    UT_hash_handle hh;                                    /* makes this structure hashable */
 };
 
 /* Typedef'd pointer to get abstract datatype. */
@@ -692,6 +704,18 @@ struct sn_community_regular_expression {
     UT_hash_handle hh; /* makes this structure hashable */
 };
 
+
+typedef struct n2n_tcp_connection {
+    SOCKET socket_fd;       /* file descriptor for tcp socket */
+    struct sockaddr sock;   /* network order socket */
+
+    uint16_t expected;                                    /* number of bytes expected to be read */
+    uint16_t position;                                    /* current position in the buffer*/
+    uint8_t  buffer[N2N_PKT_BUF_SIZE + sizeof(uint16_t)]; /* buffer for data collected from tcp socket incl. prepended length */
+
+    UT_hash_handle hh; /* makes this structure hashable */
+} n2n_tcp_connection_t;
+
 typedef struct n2n_sn {
     time_t                                 start_time;      /* Used to measure uptime. */
     sn_stats_t                             stats;
@@ -700,7 +724,9 @@ typedef struct n2n_sn {
     uint16_t                               lport;           /* Local UDP port to bind to. */
     uint16_t                               mport;           /* Management UDP port to bind to. */
     int                                    sock;            /* Main socket for UDP traffic with edges. */
-    int                                    mgmt_sock;         /* management socket. */
+    int                                    tcp_sock;        /* auxiliary socket for optional TCP connections */
+    n2n_tcp_connection_t                   *tcp_connections;/* list of established TCP connections */
+    int                                    mgmt_sock;       /* management socket. */
     n2n_ip_subnet_t                        min_auto_ip_net; /* Address range of auto_ip service. */
     n2n_ip_subnet_t                        max_auto_ip_net; /* Address range of auto_ip service. */
 #ifndef WIN32
