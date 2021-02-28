@@ -863,7 +863,6 @@ static ssize_t sendto_sock (n2n_edge_t *eee, const void * buf,
 
     struct sockaddr_in peer_addr;
     ssize_t sent;
-    int rc;
     int value = 0;
 
     if(!dest->family)
@@ -957,7 +956,6 @@ void send_query_peer (n2n_edge_t * eee,
     n2n_common_t cmn = {0};
     n2n_QUERY_PEER_t query = {{0}};
     struct peer_info *peer, *tmp;
-    uint8_t tmp_pkt[N2N_PKT_BUF_SIZE];
     int n_o_pings = 0;
     int n_o_top_sn = 0;
     int n_o_rest_sn = 0;
@@ -1307,8 +1305,6 @@ static void send_grat_arps (n2n_edge_t * eee) {
  */
 void update_supernode_reg (n2n_edge_t * eee, time_t now) {
 
-    struct peer_info *scan, *tmp;
-
     if(eee->sn_wait && (now > (eee->last_register_req + (eee->conf.register_interval/10)))) {
         /* fall through */
         traceEvent(TRACE_DEBUG, "update_supernode_reg: doing fast retry.");
@@ -1395,12 +1391,12 @@ static int handle_PACKET (n2n_edge_t * eee,
         if(!memcmp(pkt->dstMac, broadcast_mac, N2N_MAC_SIZE))
             ++(eee->stats.rx_sup_broadcast);
 
-            ++(eee->stats.rx_sup);
-            eee->last_sup = now;
-        } else {
-            ++(eee->stats.rx_p2p);
-            eee->last_p2p=now;
-        }
+        ++(eee->stats.rx_sup);
+        eee->last_sup = now;
+    } else {
+        ++(eee->stats.rx_p2p);
+        eee->last_p2p=now;
+    }
 
     /* Handle transform. */
     {
@@ -1670,7 +1666,7 @@ static void readFromMgmtSocket (n2n_edge_t *eee, int *keep_running) {
     HASH_ITER(hh, eee->pending_peers, peer, tmpPeer) {
         ++num_pending_peers;
         net = htonl(peer->dev_addr.net_addr);
-        sprintf (time_buf, "%9u", now - peer->last_seen);
+        sprintf (time_buf, "%9u", (unsigned int)(now - peer->last_seen));
         msg_len += snprintf((char *) (udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                             "%4u | %-15s | %-17s | %-21s | %-15s | %9s\n",
                             ++num,
@@ -1694,7 +1690,7 @@ static void readFromMgmtSocket (n2n_edge_t *eee, int *keep_running) {
     HASH_ITER(hh, eee->known_peers, peer, tmpPeer) {
         ++num_known_peers;
         net = htonl(peer->dev_addr.net_addr);
-        sprintf (time_buf, "%9u", now - peer->last_seen);
+        sprintf (time_buf, "%9u", (unsigned int)(now - peer->last_seen));
         msg_len += snprintf((char *) (udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                             "%4u | %-15s | %-17s | %-21s | %-15s | %9s\n",
                             ++num,
@@ -1718,7 +1714,7 @@ static void readFromMgmtSocket (n2n_edge_t *eee, int *keep_running) {
 
     HASH_ITER(hh, eee->conf.supernodes, peer, tmpPeer) {
         net = htonl(peer->dev_addr.net_addr);
-        sprintf (time_buf, "%9u", now - peer->last_seen);
+        sprintf (time_buf, "%9u", (unsigned int)(now - peer->last_seen));
         msg_len += snprintf((char *) (udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                             "%4u | %-3s %-11s | %-17s | %-21s | %-15s | %9s\n",
                             ++num,
@@ -2061,7 +2057,7 @@ void edge_read_from_tap (n2n_edge_t * eee) {
                     eee->tuntap_priv_conf.netmask, eee->tuntap_priv_conf.device_mac, eee->tuntap_priv_conf.mtu
 #ifdef WIN32
 				   ,eee->tuntap_priv_conf.metric
-#endif                    
+#endif
                     );
     } else {
         const uint8_t * mac = eth_pkt;
@@ -2118,6 +2114,7 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr_in *sender_sock, const 
     size_t                idx;
     size_t                msg_type;
     uint8_t               from_supernode;
+    uint8_t               via_multicast;
     peer_info_t           *sn = NULL;
     n2n_sock_t            sender;
     n2n_sock_t *          orig_sender = NULL;
@@ -2141,11 +2138,12 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr_in *sender_sock, const 
      * hop as sender. */
     orig_sender = &sender;
 
+    via_multicast = (in_sock == eee->udp_multicast_sock);
+
     traceEvent(TRACE_DEBUG, "### Rx N2N UDP (%d) from %s",
                (signed int)udp_size, sock_to_cstr(sockbuf1, &sender));
 
     if(eee->conf.header_encryption == HEADER_ENCRYPTION_ENABLED) {
-        uint16_t checksum = 0;
         if(packet_header_decrypt(udp_buf, udp_size,
                                  (char *)eee->conf.community_name,
                                  eee->conf.header_encryption_ctx, eee->conf.header_iv_ctx,
@@ -2162,8 +2160,13 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr_in *sender_sock, const 
     rem = udp_size; /* Counts down bytes of packet to protect against buffer overruns. */
     idx = 0; /* marches through packet header as parts are decoded. */
     if(decode_common(&cmn, udp_buf, &rem, &idx) < 0) {
-            traceEvent(TRACE_ERROR, "Failed to decode common section in N2N_UDP");
-            return; /* failed to decode packet */
+        if(via_multicast) {
+            // from some other edge on local network, possibly header encrypted
+            traceEvent(TRACE_DEBUG, "dropped packet arriving via multicast due to error while decoding N2N_UDP");
+        } else {
+            traceEvent(TRACE_WARNING, "failed to decode common section in N2N_UDP");
+        }
+        return; /* failed to decode packet */
     }
 
     msg_type = cmn.pc; /* packet code */
@@ -2230,11 +2233,10 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr_in *sender_sock, const 
             case MSG_TYPE_REGISTER: {
                 /* Another edge is registering with us */
                 n2n_REGISTER_t reg;
-                int via_multicast;
 
                 decode_REGISTER(&reg, &cmn, udp_buf, &rem, &idx);
 
-                via_multicast = is_null_mac(reg.dstMac);
+                via_multicast &= is_null_mac(reg.dstMac);
 
                 if(eee->conf.header_encryption == HEADER_ENCRYPTION_ENABLED) {
                     if(!find_peer_time_stamp_and_verify (eee, sn, reg.srcMac, stamp,
@@ -2447,7 +2449,6 @@ void process_udp (n2n_edge_t *eee, const struct sockaddr_in *sender_sock, const 
                 n2n_PEER_INFO_t pi;
                 struct peer_info * scan;
                 int skip_add;
-                SN_SELECTION_CRITERION_DATA_TYPE data;
 
                 decode_PEER_INFO(&pi, &cmn, udp_buf, &rem, &idx);
 
@@ -2649,7 +2650,6 @@ int run_edge_loop (n2n_edge_t *eee, int *keep_running) {
         fd_set socket_mask;
         struct timeval wait_time;
         time_t now;
-        size_t   bread;
 
         FD_ZERO(&socket_mask);
 
@@ -2819,8 +2819,6 @@ void edge_term (n2n_edge_t * eee) {
 
 
 static int edge_init_sockets (n2n_edge_t *eee) {
-
-    int sockopt;
 
     if(eee->udp_mgmt_sock >= 0)
         closesocket(eee->udp_mgmt_sock);
